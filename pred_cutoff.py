@@ -1,4 +1,4 @@
-"""Läser apexbantrackers RSS-flöde och postar nya/ändrade poster till en Discord-webhook."""
+"""Läser apexbantrackers RSS-flöde och håller ett Discord-meddelande per dag som uppdateras live."""
 import hashlib, html, json, os, re, sys, time
 from pathlib import Path
 
@@ -6,8 +6,9 @@ import feedparser
 import requests
 
 FEED_URL = os.environ.get("FEED_URL", "https://apexbantracker.com/api/leaderboard/cutoff/feed.xml?platform=PC")
-WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"].split("?")[0].rstrip("/")
 STATE_FILE = Path("state.json")
+DATUM = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def rensa(text, maxlen):
@@ -15,29 +16,47 @@ def rensa(text, maxlen):
     return text[: maxlen - 1] + "…" if len(text) > maxlen else text
 
 
+def dag(e):
+    """Vilken dag posten gäller: första datumet i texten, annars postens egen tidsstämpel."""
+    m = DATUM.search(e.get("summary", "")) or DATUM.search(e.get("title", ""))
+    if m:
+        return m.group(0)
+    t = e.get("published_parsed") or e.get("updated_parsed")
+    return time.strftime("%Y-%m-%d", t) if t else (e.get("id") or e.get("link") or e.get("title", ""))
+
+
 def fingeravtryck(e):
-    raw = "|".join([e.get("title", ""), e.get("summary", ""), e.get("updated", "") or e.get("published", "")])
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return hashlib.sha256((e.get("title", "") + "|" + e.get("summary", "")).encode()).hexdigest()
 
 
-def posta(e):
-    embed = {
+def embed(e):
+    em = {
         "title": rensa(e.get("title", "Pred cutoff"), 256) or "Pred cutoff",
         "description": rensa(e.get("summary", ""), 4000),
         "color": 0xDA292A,
     }
     if e.get("link"):
-        embed["url"] = e["link"]
+        em["url"] = e["link"]
     t = e.get("updated_parsed") or e.get("published_parsed")
-    if t:
-        embed["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", t)
-    r = requests.post(
-        WEBHOOK_URL + "?wait=true",
-        json={"embeds": [embed], "allowed_mentions": {"parse": []}},  # pinga aldrig någon
-        timeout=20,
-    )
+    em["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", t or time.gmtime())
+    return {"embeds": [em], "allowed_mentions": {"parse": []}}  # pinga aldrig någon
+
+
+def posta(e):
+    r = requests.post(WEBHOOK_URL + "?wait=true", json=embed(e), timeout=20)
     r.raise_for_status()
-    time.sleep(1)  # undvik Discords rate limit
+    time.sleep(1)
+    return r.json()["id"]
+
+
+def redigera(msg_id, e):
+    """Uppdaterar ett befintligt meddelande. Returnerar False om det har tagits bort."""
+    r = requests.patch(f"{WEBHOOK_URL}/messages/{msg_id}", json=embed(e), timeout=20)
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+    time.sleep(1)
+    return True
 
 
 def main():
@@ -48,27 +67,36 @@ def main():
         print("Flödet var tomt, inget att göra.")
         return
 
-    forsta_gangen = not STATE_FILE.exists()
-    sedda = {} if forsta_gangen else json.loads(STATE_FILE.read_text()).get("seen", {})
-
-    nya = []
+    # En post per dag: den först listade (nyaste) vinner om flera gäller samma dag.
+    per_dag = {}
     for e in entries:
-        pid = e.get("id") or e.get("link") or e.get("title", "")
-        fp = fingeravtryck(e)
-        if sedda.get(pid) != fp:
-            nya.append(e)
-        sedda[pid] = fp
+        per_dag.setdefault(dag(e), e)
 
-    if forsta_gangen:
-        print("Första körningen: postar bara senaste posten.")
-        posta(entries[0])
-    else:
-        for e in reversed(nya):  # äldst först
-            posta(e)
-        print(f"Postade {len(nya)} ny(a) uppdatering(ar).")
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    dagar = state.get("days")
+    forsta_gangen = dagar is None
+    dagar = dagar or {}
+    senaste = max(per_dag)
 
-    aktuella = {e.get("id") or e.get("link") or e.get("title", "") for e in entries}
-    STATE_FILE.write_text(json.dumps({"seen": {k: v for k, v in sedda.items() if k in aktuella}}, indent=2))
+    for d in sorted(per_dag):
+        e, fp = per_dag[d], fingeravtryck(per_dag[d])
+        info = dagar.get(d, {})
+        if info.get("fp") == fp:
+            continue
+        if forsta_gangen and d != senaste:
+            dagar[d] = {"fp": fp}  # posta inte gammal historik vid start
+            continue
+        if info.get("msg") and redigera(info["msg"], e):
+            print(f"{d}: uppdaterade meddelandet.")
+            dagar[d] = {"fp": fp, "msg": info["msg"]}
+        elif d not in dagar or d == senaste:
+            dagar[d] = {"fp": fp, "msg": posta(e)}
+            print(f"{d}: postade nytt meddelande.")
+        else:
+            dagar[d] = {"fp": fp}  # gammal dag utan meddelande: posta inte igen
+
+    # Spara bara dagar som fortfarande finns i flödet.
+    STATE_FILE.write_text(json.dumps({"days": {d: v for d, v in dagar.items() if d in per_dag}}, indent=2))
 
 
 if __name__ == "__main__":
